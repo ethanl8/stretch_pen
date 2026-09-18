@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ROS workspace outputs
+build/
+install/
+log/
+
+# ROS recordings
+*.bag
+*.db3
+*.mcap
+
+# ML weights and generated data
+*.pt
+runs/
+
+# Editor and OS files
+.vscode/
+.DS_Store
+
+# Secrets
+.env
+*.key
