@@ -8,7 +8,8 @@ from cv_bridge import CvBridge
 import cv2
 from ultralytics import YOLO
 from pathlib import Path
-
+import shutil
+import subprocess
 
 class OfferPenNode(Node):
     JOINT_NAMES = [
@@ -99,7 +100,7 @@ class OfferPenNode(Node):
         super().__init__('offer_pen_node')
 
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
-        self.declare_parameter('person_area_threshold', 8000.0)
+        self.declare_parameter('person_area_threshold', 800000.0)
         self.declare_parameter(
             'model_path',
             str(Path(__file__).with_name('yolov8n.pt')),
@@ -139,6 +140,58 @@ class OfferPenNode(Node):
         self.starting_pause_timer = None
         self.get_logger().info('Pen Offer Node started.')
 
+        #Sound Settings
+
+        self.declare_parameter(
+            'pen_offer_text',
+            'Please take a pen.',
+        )
+        self.declare_parameter('speech_rate', 150)
+
+        self.speech_process = None
+
+        self.tts_program = (
+            shutil.which('espeak-ng')
+            or shutil.which('espeak')
+        )
+
+        if self.tts_program is None:
+            self.get_logger().warning(
+                "Neither espeak-ng nor espeak was found. "
+                "Speech is disabled."
+            )
+    
+    def speak(self, text):
+        if self.tts_program is None:
+            return
+
+        # Avoid overlapping multiple speech processes
+        if (
+            self.speech_process is not None
+            and self.speech_process.poll() is None
+        ):
+            return
+
+        rate = str(self.get_parameter('speech_rate').value)
+
+        try:
+            self.speech_process = subprocess.Popen(
+                [
+                    self.tts_program,
+                    '-s',
+                    rate,
+                    '-v',
+                    'en-us',
+                    text,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            self.get_logger().error(
+                f"Could not start speech: {error}"
+            )
+
     def image_callback(self, msg):
         if self.state not in ('SEARCHING', 'HOLDING', 'WAITING'):
             return
@@ -165,7 +218,7 @@ class OfferPenNode(Node):
                 break
 
         if self.state == 'SEARCHING' and self.person_in_frame:
-            self.get_logger().info('Person detected. Moving to hold-out position...')
+            self.get_logger().info('Person detected with area {}. Moving to hold-out position...'.format(area))
             self.state = 'HOLDING'
             self.move_to_hold_out()
 
@@ -240,6 +293,11 @@ class OfferPenNode(Node):
             4,
             self.start_offer_wait,
         )
+
+        speech_text = self.get_parameter(
+            'pen_offer_text'
+        ).value
+        self.speak(speech_text)
 
     def start_offer_wait(self):
         self.state = 'WAITING'
