@@ -5,11 +5,11 @@ from sensor_msgs.msg import Image
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from cv_bridge import CvBridge
-import cv2
 from ultralytics import YOLO
 from pathlib import Path
 import shutil
 import subprocess
+
 
 class OfferPenNode(Node):
     JOINT_NAMES = [
@@ -100,17 +100,30 @@ class OfferPenNode(Node):
         super().__init__('offer_pen_node')
 
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
-        self.declare_parameter('person_area_threshold', 800000.0)
+        self.declare_parameter('person_area_threshold', 750000.0)
+        self.declare_parameter('person_height_min_pixels', 300.0)
+        self.declare_parameter('person_height_max_pixels', 900.0)
+        self.declare_parameter('gripper_lift_min', 0.60)
+        self.declare_parameter('gripper_lift_max', 1.00)
         self.declare_parameter(
             'model_path',
-            str(Path(__file__).with_name('yolov8n.pt')),
+            str(Path(__file__).with_name('yolov8n-pose.pt')),
         )
+
 
         # Initialize YOLOv8 (using the nano model for fast real-time inference)
         model_path = self.get_parameter('model_path').value
         self.person_area_threshold = self.get_parameter(
             'person_area_threshold'
         ).value
+        self.person_height_min_pixels = self.get_parameter(
+            'person_height_min_pixels'
+        ).value
+        self.person_height_max_pixels = self.get_parameter(
+            'person_height_max_pixels'
+        ).value
+        self.gripper_lift_min = self.get_parameter('gripper_lift_min').value
+        self.gripper_lift_max = self.get_parameter('gripper_lift_max').value
         self.model = YOLO(model_path)
         self.bridge = CvBridge()
 
@@ -135,6 +148,7 @@ class OfferPenNode(Node):
         self.last_inference_time = 0.0
         self.offer_wait_timer = None
         self.person_in_frame = False
+        self.target_gripper_lift = self.HOLD_OUT_POSITION[1]
         self.active_goal_handle = None
         self.startup_timer = self.create_timer(1.0, self.move_to_starting_raise)
         self.starting_pause_timer = None
@@ -208,6 +222,7 @@ class OfferPenNode(Node):
         results = self.model(cv_image, classes=[0], verbose=False)
 
         self.person_in_frame = False
+        largest_person = None
         for box in results[0].boxes:
             # Calculate bounding box area to estimate distance
             x1, y1, x2, y2 = box.xyxy[0].tolist()
@@ -215,12 +230,32 @@ class OfferPenNode(Node):
 
             if area > self.person_area_threshold:
                 self.person_in_frame = True
-                break
+                if largest_person is None or area > largest_person[0]:
+                    largest_person = (area, y2 - y1)
 
         if self.state == 'SEARCHING' and self.person_in_frame:
-            self.get_logger().info('Person detected with area {}. Moving to hold-out position...'.format(area))
+            area, person_height = largest_person
+            self.target_gripper_lift = self.lift_for_person_height(person_height)
+            self.get_logger().info(
+                'Person detected with area %.0f and height %.0f px. '
+                'Moving gripper to lift %.2f...'
+                % (area, person_height, self.target_gripper_lift)
+            )
             self.state = 'HOLDING'
             self.move_to_hold_out()
+
+    def lift_for_person_height(self, person_height):
+        height_range = self.person_height_max_pixels - self.person_height_min_pixels
+        if height_range <= 0:
+            return self.gripper_lift_min
+
+        normalized_height = (
+            person_height - self.person_height_min_pixels
+        ) / height_range
+        normalized_height = max(0.0, min(1.0, normalized_height))
+        return self.gripper_lift_min + normalized_height * (
+            self.gripper_lift_max - self.gripper_lift_min
+        )
 
     def move_to_starting_raise(self):
         if not self.arm_client.wait_for_server(timeout_sec=0.0):
@@ -287,9 +322,11 @@ class OfferPenNode(Node):
 
     def move_to_hold_out(self):
         self.get_logger().info('Moving to hold-out position...')
+        hold_out_position = list(self.HOLD_OUT_POSITION)
+        hold_out_position[1] = self.target_gripper_lift
         self.send_trajectory(
             self.JOINT_NAMES,
-            self.HOLD_OUT_POSITION,
+            hold_out_position,
             4,
             self.start_offer_wait,
         )
