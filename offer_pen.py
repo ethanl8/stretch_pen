@@ -24,6 +24,8 @@ class OfferPenNode(Node):
         'joint_head_tilt',
     ]
 
+    TRAJECTORY_JOINT_NAMES = JOINT_NAMES[:7]
+
     STARTING_RAISE = [
         0.2,
         0.8,
@@ -100,7 +102,9 @@ class OfferPenNode(Node):
         super().__init__('offer_pen_node')
 
         self.declare_parameter('image_topic', '/camera/camera/color/image_raw')
-        self.declare_parameter('person_area_threshold', 750000.0)
+        self.declare_parameter('person_area_threshold', 700000.0)
+        self.declare_parameter('person_detection_confidence', 0.35)
+        self.declare_parameter('person_lost_timeout', 4.0)
         self.declare_parameter('person_height_min_pixels', 300.0)
         self.declare_parameter('person_height_max_pixels', 900.0)
         self.declare_parameter('gripper_lift_min', 0.60)
@@ -110,11 +114,16 @@ class OfferPenNode(Node):
             str(Path(__file__).with_name('yolov8n-pose.pt')),
         )
 
-
         # Initialize YOLOv8 (using the nano model for fast real-time inference)
         model_path = self.get_parameter('model_path').value
         self.person_area_threshold = self.get_parameter(
             'person_area_threshold'
+        ).value
+        self.person_detection_confidence = self.get_parameter(
+            'person_detection_confidence'
+        ).value
+        self.person_lost_timeout = self.get_parameter(
+            'person_lost_timeout'
         ).value
         self.person_height_min_pixels = self.get_parameter(
             'person_height_min_pixels'
@@ -148,6 +157,7 @@ class OfferPenNode(Node):
         self.last_inference_time = 0.0
         self.offer_wait_timer = None
         self.person_in_frame = False
+        self.last_person_seen_time = None
         self.target_gripper_lift = self.HOLD_OUT_POSITION[1]
         self.active_goal_handle = None
         self.startup_timer = self.create_timer(1.0, self.move_to_starting_raise)
@@ -221,19 +231,31 @@ class OfferPenNode(Node):
         # Run YOLOv8 detection (class 0 is 'person')
         results = self.model(cv_image, classes=[0], verbose=False)
 
-        self.person_in_frame = False
+        person_seen = False
         largest_person = None
         for box in results[0].boxes:
             # Calculate bounding box area to estimate distance
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             area = (x2 - x1) * (y2 - y1)
+            confidence = float(box.conf[0])
 
-            if area > self.person_area_threshold:
-                self.person_in_frame = True
+            if (
+                area > self.person_area_threshold
+                and confidence >= self.person_detection_confidence
+            ):
+                person_seen = True
                 if largest_person is None or area > largest_person[0]:
                     largest_person = (area, y2 - y1)
 
-        if self.state == 'SEARCHING' and self.person_in_frame:
+        if person_seen:
+            self.last_person_seen_time = now
+
+        self.person_in_frame = (
+            self.last_person_seen_time is not None
+            and now - self.last_person_seen_time <= self.person_lost_timeout
+        )
+
+        if self.state == 'SEARCHING' and largest_person is not None:
             area, person_height = largest_person
             self.target_gripper_lift = self.lift_for_person_height(person_height)
             self.get_logger().info(
@@ -257,6 +279,7 @@ class OfferPenNode(Node):
             self.gripper_lift_max - self.gripper_lift_min
         )
 
+    # Move to Starting Raise Position (Avoid table)
     def move_to_starting_raise(self):
         if not self.arm_client.wait_for_server(timeout_sec=0.0):
             return
@@ -269,7 +292,7 @@ class OfferPenNode(Node):
             self.move_to_starting_position,
         )
 
-
+    # Move to Starting Position to pick up pen holder
     def move_to_starting_position(self):
         if not self.arm_client.wait_for_server(timeout_sec=0.0):
             return
@@ -283,19 +306,18 @@ class OfferPenNode(Node):
             self.pause_at_start,
         )
 
+    # Pause before Closing gripper
     def pause_at_start(self):
         self.get_logger().info('At starting position. Pausing before closing gripper...')
         self.starting_pause_timer = self.create_timer(
             1.0,
-            self.close_gripper_after_pause,
+            self.close_gripper,
         )
 
-    def close_gripper_after_pause(self):
+    #Close Gripper after pause
+    def close_gripper(self):
         self.starting_pause_timer.cancel()
         self.starting_pause_timer = None
-        self.close_gripper()
-
-    def close_gripper(self):
         self.state = 'GRIPPING'
         self.get_logger().info('Closing gripper...')
         self.send_trajectory(
@@ -305,6 +327,7 @@ class OfferPenNode(Node):
             self.move_to_reset,
         )
 
+    # Move to Reset Position
     def move_to_reset(self):
         self.state = 'RESETTING'
         self.get_logger().info('Moving to reset position...')
@@ -315,11 +338,13 @@ class OfferPenNode(Node):
             self.start_searching,
         )
 
+    # Start Searching for people
     def start_searching(self):
         self.state = 'SEARCHING'
         self.person_in_frame = False
         self.get_logger().info('At reset position. Waiting for a person...')
 
+    # If person detected, move to hold-out position
     def move_to_hold_out(self):
         self.get_logger().info('Moving to hold-out position...')
         hold_out_position = list(self.HOLD_OUT_POSITION)
@@ -336,11 +361,13 @@ class OfferPenNode(Node):
         ).value
         self.speak(speech_text)
 
+    # Start waiting for the person to leave
     def start_offer_wait(self):
         self.state = 'WAITING'
         self.get_logger().info('Waiting 3 seconds for the person to leave...')
         self.offer_wait_timer = self.create_timer(3.0, self.check_person_before_reset)
 
+    # Check if person is still present before reset
     def check_person_before_reset(self):
         self.offer_wait_timer.cancel()
         self.offer_wait_timer = None
@@ -350,14 +377,18 @@ class OfferPenNode(Node):
             self.offer_wait_timer = self.create_timer(3.0, self.check_person_before_reset)
             return
 
-        self.get_logger().info('Person left the frame. Returning to reset position...')
-        self.move_to_reset()
+        self.person_in_frame = False
+        self.last_person_seen_time = None
+        self.state = 'SEARCHING'
+        self.get_logger().info(
+            'Person left the frame. Holding position and waiting for a new person...'
+        )
 
     def send_trajectory(self, joint_names, positions, duration, on_complete):
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = joint_names
+        goal.trajectory.joint_names = self.TRAJECTORY_JOINT_NAMES
         point = JointTrajectoryPoint()
-        point.positions = positions
+        point.positions = positions[:7]
         point.time_from_start.sec = duration
         goal.trajectory.points.append(point)
 
